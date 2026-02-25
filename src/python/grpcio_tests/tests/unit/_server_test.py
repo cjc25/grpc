@@ -309,15 +309,16 @@ class ServerHandlerBackgroundThreadTest(unittest.TestCase):
                 nonlocal fail_fn
                 # fail in the background
                 failer = threading.Thread(
-                        target=fail_fn, args=(servicer_context,))
+                    target=fail_fn, args=(servicer_context,)
+                )
                 failer.start()
                 # discard requests in the foreground
                 try:
                     list(request_iterator)
                 finally:
                     failer.join()
-            self._fail_handler = fail_handler
 
+            self._fail_handler = fail_handler
 
         def service(self, handler_call_details):
             if handler_call_details.method == _STREAM_STREAM:
@@ -350,10 +351,12 @@ class ServerHandlerBackgroundThreadTest(unittest.TestCase):
         done = threading.Event()
         try:
             with self.assertRaises(grpc.RpcError):
-                list(self._channel.stream_stream(
+                list(
+                    self._channel.stream_stream(
                         _STREAM_STREAM,
                         _registered_method=True,
-                )(self._BlockingRequestIterator(done)))
+                    )(self._BlockingRequestIterator(done))
+                )
         finally:
             # To release any resources held by _blockingRequestIterator()
             done.set()
@@ -362,8 +365,9 @@ class ServerHandlerBackgroundThreadTest(unittest.TestCase):
         self._run_background_fail_test(lambda ctx: ctx.cancel())
 
     def test_fail_via_abort(self):
-      self._run_background_fail_test(
-          lambda ctx: ctx.abort(grpc.StatusCode.ABORTED, "fail"))
+        self._run_background_fail_test(
+            lambda ctx: ctx.abort(grpc.StatusCode.ABORTED, "fail")
+        )
 
 
 if __name__ == "__main__":
