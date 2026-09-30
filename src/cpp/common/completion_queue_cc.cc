@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "src/core/lib/experiments/experiments.h"
+#include "src/core/lib/surface/completion_queue.h"
 #include "src/core/util/crash.h"
 #include "src/core/util/grpc_check.h"
 #include "src/core/util/sync.h"
@@ -140,6 +141,8 @@ void CompletionQueue::Shutdown() {
 #endif
   CompleteAvalanching();
 }
+
+int CompletionQueue::ReleaseEventFd() { return grpc_cq_release_eventfd(cq_); }
 
 CompletionQueue::NextStatus CompletionQueue::AsyncNextInternal(
     void** tag, bool* ok, gpr_timespec deadline) {

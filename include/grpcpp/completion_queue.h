@@ -245,6 +245,27 @@ class CompletionQueue : private grpc::internal::GrpcLibrary {
   /// ownership is performed.
   grpc_completion_queue* cq() { return cq_; }
 
+  /// Creates and releases ownership of a non-blocking Linux \a eventfd file
+  /// descriptor associated with this completion queue.
+  ///
+  /// The returned \a eventfd becomes readable when the completion queue
+  /// transitions from empty to non-empty or when it finishes shutting down.
+  /// On a read from the \a eventfd (e.g., via \a eventfd_read after waking from
+  /// \a epoll_wait), the consumer must drain \a AsyncNext entirely by calling
+  /// \a AsyncNext with a zero deadline in a loop until it returns
+  /// \a NextStatus::TIMEOUT (or \a NextStatus::SHUTDOWN) before waiting on the
+  /// \a eventfd again.
+  ///
+  /// \note Ownership of the returned file descriptor is transferred to the
+  /// caller. The caller is responsible for tracking which \a CompletionQueue
+  /// the \a eventfd is paired with and closing the file descriptor only after
+  /// the \a CompletionQueue has been shut down and completely drained.
+  ///
+  /// \return A non-negative file descriptor on success, or -1 if unsupported
+  ///         on the current platform, if this is not a NEXT completion queue,
+  ///         or if an \a eventfd has already been released for this queue.
+  int ReleaseEventFd();
+
  protected:
   /// Private constructor of CompletionQueue only visible to friend classes
   explicit CompletionQueue(const grpc_completion_queue_attributes& attributes) {
