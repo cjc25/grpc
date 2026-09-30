@@ -87,4 +87,16 @@ grpc_completion_queue* grpc_completion_queue_create_internal(
     grpc_cq_completion_type completion_type, grpc_cq_polling_type polling_type,
     grpc_completion_queue_functor* shutdown_callback);
 
+// Creates and returns a non-blocking Linux eventfd associated with a
+// GRPC_CQ_NEXT completion queue that becomes readable when the queue
+// transitions from empty to non-empty or when the completion queue finishes
+// shutting down. On a read from the eventfd, the consumer must drain the
+// completion queue entirely by calling grpc_completion_queue_next() (or
+// CompletionQueue::AsyncNext()) with a zero deadline in a loop until it returns
+// GRPC_QUEUE_TIMEOUT (or GRPC_QUEUE_SHUTDOWN). Returns -1 if unsupported or if
+// an eventfd has already been released for this completion queue. Ownership of
+// the returned file descriptor is transferred to the caller, who is responsible
+// for closing it after the completion queue is shut down and drained.
+int grpc_cq_release_eventfd(grpc_completion_queue* cq);
+
 #endif  // GRPC_SRC_CORE_LIB_SURFACE_COMPLETION_QUEUE_H

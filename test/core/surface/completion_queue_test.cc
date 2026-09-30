@@ -27,11 +27,23 @@
 
 #include "src/core/lib/event_engine/shim.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
+#include "src/core/lib/iomgr/port.h"
 #include "src/core/util/useful.h"
 #include "test/core/test_util/test_config.h"
 #include "gtest/gtest.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+
+#ifdef GRPC_LINUX_EVENTFD
+#include <errno.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <thread>
+#include <vector>
+#endif
 
 #define LOG_TEST(x) LOG(INFO) << x
 
@@ -494,6 +506,482 @@ struct thread_state {
   grpc_completion_queue* cc;
   void* tag;
 };
+
+#ifdef GRPC_LINUX_EVENTFD
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdValidation) {
+  ASSERT_EQ(grpc_cq_release_eventfd(nullptr), -1);
+
+  grpc_completion_queue_attributes pluck_attr = {};
+  pluck_attr.version = 1;
+  pluck_attr.cq_completion_type = GRPC_CQ_PLUCK;
+  pluck_attr.cq_polling_type = GRPC_CQ_DEFAULT_POLLING;
+  grpc_completion_queue* pluck_cq = grpc_completion_queue_create(
+      grpc_completion_queue_factory_lookup(&pluck_attr), &pluck_attr, nullptr);
+  ASSERT_EQ(grpc_cq_release_eventfd(pluck_cq), -1);
+  shutdown_and_destroy(pluck_cq);
+
+  grpc_cq_polling_type polling_types[] = {
+      GRPC_CQ_DEFAULT_POLLING, GRPC_CQ_NON_LISTENING, GRPC_CQ_NON_POLLING};
+  for (size_t i = 0; i < GPR_ARRAY_SIZE(polling_types); i++) {
+    grpc_completion_queue_attributes attr = {};
+    attr.version = 1;
+    attr.cq_completion_type = GRPC_CQ_NEXT;
+    attr.cq_polling_type = polling_types[i];
+    grpc_completion_queue* cq = grpc_completion_queue_create(
+        grpc_completion_queue_factory_lookup(&attr), &attr, nullptr);
+    int efd = grpc_cq_release_eventfd(cq);
+    ASSERT_GE(efd, 0);
+    // Releasing a second time on the same CQ must fail.
+    ASSERT_EQ(grpc_cq_release_eventfd(cq), -1);
+
+    // Initially, the eventfd must be non-blocking and have counter 0 (EAGAIN).
+    eventfd_t val = 0;
+    ASSERT_EQ(eventfd_read(efd, &val), -1);
+    ASSERT_EQ(errno, EAGAIN);
+
+    shutdown_and_destroy(cq);
+    close(efd);
+  }
+}
+
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdOpAndShutdown) {
+  grpc_cq_polling_type polling_types[] = {
+      GRPC_CQ_DEFAULT_POLLING, GRPC_CQ_NON_LISTENING, GRPC_CQ_NON_POLLING};
+  for (size_t i = 0; i < GPR_ARRAY_SIZE(polling_types); i++) {
+    grpc_core::ExecCtx exec_ctx;
+    grpc_completion_queue_attributes attr = {};
+    attr.version = 1;
+    attr.cq_completion_type = GRPC_CQ_NEXT;
+    attr.cq_polling_type = polling_types[i];
+    grpc_completion_queue* cq = grpc_completion_queue_create(
+        grpc_completion_queue_factory_lookup(&attr), &attr, nullptr);
+    int efd = grpc_cq_release_eventfd(cq);
+    ASSERT_GE(efd, 0);
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    ASSERT_GE(epfd, 0);
+    struct epoll_event ev = {};
+    ev.events = EPOLLIN;
+    ev.data.fd = efd;
+    ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev), 0);
+
+    struct epoll_event out_ev = {};
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 0);
+
+    // 1. Single op completion triggers eventfd; consumer drains until
+    //    GRPC_QUEUE_TIMEOUT.
+    void* tag1 = create_test_tag();
+    grpc_cq_completion comp1;
+    ASSERT_TRUE(grpc_cq_begin_op(cq, tag1));
+    grpc_cq_end_op(cq, tag1, absl::OkStatus(), do_nothing_end_completion,
+                   nullptr, &comp1);
+
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 1);
+    ASSERT_EQ(out_ev.data.fd, efd);
+    eventfd_t val = 0;
+    ASSERT_EQ(eventfd_read(efd, &val), 0);
+    ASSERT_EQ(val, 1u);
+
+    grpc_event cq_ev = grpc_completion_queue_next(
+        cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+    ASSERT_EQ(cq_ev.type, GRPC_OP_COMPLETE);
+    ASSERT_EQ(cq_ev.tag, tag1);
+    cq_ev = grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME),
+                                       nullptr);
+    ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 0);
+
+    // 2. Multiple queued events write to eventfd only once (on empty ->
+    //    non-empty transition) and must be drained in a single loop until
+    //    GRPC_QUEUE_TIMEOUT without re-arming the eventfd on each pop.
+    void* tags[3] = {create_test_tag(), create_test_tag(), create_test_tag()};
+    grpc_cq_completion comps[3];
+    for (int k = 0; k < 3; k++) {
+      ASSERT_TRUE(grpc_cq_begin_op(cq, tags[k]));
+      grpc_cq_end_op(cq, tags[k], absl::OkStatus(), do_nothing_end_completion,
+                     nullptr, &comps[k]);
+    }
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 1);
+    ASSERT_EQ(eventfd_read(efd, &val), 0);
+    ASSERT_EQ(val, 1u);
+    for (int k = 0; k < 3; k++) {
+      cq_ev = grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME),
+                                         nullptr);
+      ASSERT_EQ(cq_ev.type, GRPC_OP_COMPLETE);
+      ASSERT_EQ(cq_ev.tag, tags[k]);
+    }
+    cq_ev = grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME),
+                                       nullptr);
+    ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 0);
+
+    // 3. Shutdown with queued events wakes epoll, and draining after
+    //    eventfd_read() yields all remaining items followed by
+    //    GRPC_QUEUE_SHUTDOWN.
+    void* shutdown_tags[2] = {create_test_tag(), create_test_tag()};
+    grpc_cq_completion shutdown_comps[2];
+    for (int k = 0; k < 2; k++) {
+      ASSERT_TRUE(grpc_cq_begin_op(cq, shutdown_tags[k]));
+      grpc_cq_end_op(cq, shutdown_tags[k], absl::OkStatus(),
+                     do_nothing_end_completion, nullptr, &shutdown_comps[k]);
+    }
+    grpc_completion_queue_shutdown(cq);
+
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 1);
+    ASSERT_EQ(eventfd_read(efd, &val), 0);
+    for (int k = 0; k < 2; k++) {
+      cq_ev = grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME),
+                                         nullptr);
+      ASSERT_EQ(cq_ev.type, GRPC_OP_COMPLETE);
+      ASSERT_EQ(cq_ev.tag, shutdown_tags[k]);
+    }
+    cq_ev = grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME),
+                                       nullptr);
+    ASSERT_EQ(cq_ev.type, GRPC_QUEUE_SHUTDOWN);
+    // No further wakeups after GRPC_QUEUE_SHUTDOWN has been returned.
+    ASSERT_EQ(epoll_wait(epfd, &out_ev, 1, 0), 0);
+
+    grpc_completion_queue_destroy(cq);
+    close(epfd);
+    close(efd);
+  }
+}
+
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdAfterEventsAlreadyQueued) {
+  grpc_core::ExecCtx exec_ctx;
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  void* tag = create_test_tag();
+  grpc_cq_completion comp;
+  ASSERT_TRUE(grpc_cq_begin_op(cq, tag));
+  grpc_cq_end_op(cq, tag, absl::OkStatus(), do_nothing_end_completion, nullptr,
+                 &comp);
+
+  // Release eventfd AFTER an event is already sitting in the queue.
+  int efd = grpc_cq_release_eventfd(cq);
+  ASSERT_GE(efd, 0);
+  eventfd_t val = 0;
+  ASSERT_EQ(eventfd_read(efd, &val), 0);
+  ASSERT_GE(val, 1u);
+
+  grpc_event cq_ev =
+      grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+  ASSERT_EQ(cq_ev.type, GRPC_OP_COMPLETE);
+  ASSERT_EQ(cq_ev.tag, tag);
+  cq_ev =
+      grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+  ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+
+  shutdown_and_destroy(cq);
+  close(efd);
+
+  // Also verify releasing eventfd AFTER shutdown has already completed on an
+  // empty CQ immediately signals the eventfd for GRPC_QUEUE_SHUTDOWN.
+  grpc_completion_queue* shutdown_cq =
+      grpc_completion_queue_create_for_next(nullptr);
+  grpc_completion_queue_shutdown(shutdown_cq);
+  int shutdown_efd = grpc_cq_release_eventfd(shutdown_cq);
+  ASSERT_GE(shutdown_efd, 0);
+  val = 0;
+  ASSERT_EQ(eventfd_read(shutdown_efd, &val), 0);
+  ASSERT_GE(val, 1u);
+  cq_ev = grpc_completion_queue_next(shutdown_cq,
+                                     gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+  ASSERT_EQ(cq_ev.type, GRPC_QUEUE_SHUTDOWN);
+  grpc_completion_queue_destroy(shutdown_cq);
+  close(shutdown_efd);
+}
+
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdThreadLocalCache) {
+  grpc_core::ExecCtx exec_ctx;
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  int efd = grpc_cq_release_eventfd(cq);
+  ASSERT_GE(efd, 0);
+
+  grpc_completion_queue_thread_local_cache_init(cq);
+  void* tag1 = create_test_tag();
+  void* tag2 = create_test_tag();
+  grpc_cq_completion comp1;
+  grpc_cq_completion comp2;
+  ASSERT_TRUE(grpc_cq_begin_op(cq, tag1));
+  ASSERT_TRUE(grpc_cq_begin_op(cq, tag2));
+  // First op goes into TLS cache (does not signal eventfd).
+  grpc_cq_end_op(cq, tag1, absl::OkStatus(), do_nothing_end_completion, nullptr,
+                 &comp1);
+  eventfd_t val = 0;
+  ASSERT_EQ(eventfd_read(efd, &val), -1);
+  ASSERT_EQ(errno, EAGAIN);
+
+  // Second op overflows TLS cache into cqd->queue (signals eventfd).
+  grpc_cq_end_op(cq, tag2, absl::OkStatus(), do_nothing_end_completion, nullptr,
+                 &comp2);
+  ASSERT_EQ(eventfd_read(efd, &val), 0);
+  ASSERT_GE(val, 1u);
+
+  void* flushed_tag = nullptr;
+  int flushed_ok = 0;
+  ASSERT_EQ(grpc_completion_queue_thread_local_cache_flush(cq, &flushed_tag,
+                                                           &flushed_ok),
+            1);
+  ASSERT_EQ(flushed_tag, tag1);
+  ASSERT_EQ(flushed_ok, 1);
+
+  grpc_event cq_ev =
+      grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+  ASSERT_EQ(cq_ev.type, GRPC_OP_COMPLETE);
+  ASSERT_EQ(cq_ev.tag, tag2);
+  cq_ev =
+      grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+  ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+
+  // Now test shutdown completing via TLS cache flush.
+  grpc_completion_queue_thread_local_cache_init(cq);
+  void* tag3 = create_test_tag();
+  grpc_cq_completion comp3;
+  ASSERT_TRUE(grpc_cq_begin_op(cq, tag3));
+  grpc_cq_end_op(cq, tag3, absl::OkStatus(), do_nothing_end_completion, nullptr,
+                 &comp3);
+  grpc_completion_queue_shutdown(cq);
+  // Shutdown is pending until the TLS cache is flushed.
+  ASSERT_EQ(eventfd_read(efd, &val), -1);
+  ASSERT_EQ(errno, EAGAIN);
+
+  ASSERT_EQ(grpc_completion_queue_thread_local_cache_flush(cq, &flushed_tag,
+                                                           &flushed_ok),
+            1);
+  ASSERT_EQ(flushed_tag, tag3);
+  // Flushing the last pending event completes shutdown and signals eventfd.
+  ASSERT_EQ(eventfd_read(efd, &val), 0);
+  ASSERT_GE(val, 1u);
+  cq_ev =
+      grpc_completion_queue_next(cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+  ASSERT_EQ(cq_ev.type, GRPC_QUEUE_SHUTDOWN);
+
+  grpc_completion_queue_destroy(cq);
+  close(efd);
+}
+
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdConcurrentProducers) {
+  constexpr int kNumProducers = 4;
+  constexpr int kOpsPerProducer = 200;
+  constexpr int kTotalOps = kNumProducers * kOpsPerProducer;
+
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  int efd = grpc_cq_release_eventfd(cq);
+  ASSERT_GE(efd, 0);
+
+  int epfd = epoll_create1(EPOLL_CLOEXEC);
+  ASSERT_GE(epfd, 0);
+  struct epoll_event ev = {};
+  ev.events = EPOLLIN;
+  ev.data.fd = efd;
+  ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev), 0);
+
+  std::vector<std::thread> producers;
+  producers.reserve(kNumProducers);
+  for (int p = 0; p < kNumProducers; p++) {
+    producers.emplace_back([cq, p]() {
+      for (int i = 0; i < kOpsPerProducer; i++) {
+        grpc_core::ExecCtx exec_ctx;
+        void* tag = reinterpret_cast<void*>(
+            static_cast<intptr_t>(p * kOpsPerProducer + i + 1));
+        ASSERT_TRUE(grpc_cq_begin_op(cq, tag));
+        grpc_cq_end_op(
+            cq, tag, absl::OkStatus(),
+            [](void* /*arg*/, grpc_cq_completion* c) { delete c; }, nullptr,
+            new grpc_cq_completion());
+      }
+    });
+  }
+
+  std::thread shutdown_thread([cq, &producers]() {
+    for (auto& t : producers) {
+      t.join();
+    }
+    grpc_completion_queue_shutdown(cq);
+  });
+
+  int completed_ops = 0;
+  bool got_shutdown = false;
+  while (!got_shutdown) {
+    struct epoll_event out_ev = {};
+    int n = epoll_wait(epfd, &out_ev, 1, 5000);
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_EQ(n, 1);
+    eventfd_t val = 0;
+    ASSERT_EQ(eventfd_read(efd, &val), 0);
+
+    // Drain all ready completions until GRPC_QUEUE_TIMEOUT or
+    // GRPC_QUEUE_SHUTDOWN.
+    for (;;) {
+      grpc_event cq_ev = grpc_completion_queue_next(
+          cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+      if (cq_ev.type == GRPC_OP_COMPLETE) {
+        completed_ops++;
+      } else if (cq_ev.type == GRPC_QUEUE_SHUTDOWN) {
+        got_shutdown = true;
+        break;
+      } else {
+        ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+        break;
+      }
+    }
+  }
+
+  shutdown_thread.join();
+  ASSERT_EQ(completed_ops, kTotalOps);
+
+  grpc_completion_queue_destroy(cq);
+  close(epfd);
+  close(efd);
+}
+
+TEST(GrpcCompletionQueueTest,
+     TestReleaseEventFdMultiConsumerAndCloseOnShutdown) {
+  constexpr int kNumProducers = 4;
+  constexpr int kOpsPerProducer = 200;
+  constexpr int kTotalOps = kNumProducers * kOpsPerProducer;
+  constexpr int kNumConsumers = 3;
+
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  int efd = grpc_cq_release_eventfd(cq);
+  ASSERT_GE(efd, 0);
+
+  int epfd = epoll_create1(EPOLL_CLOEXEC);
+  ASSERT_GE(epfd, 0);
+  struct epoll_event ev = {};
+  ev.events = EPOLLIN;
+  ev.data.fd = efd;
+  ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev), 0);
+
+  std::atomic<int> completed_ops{0};
+  std::vector<std::thread> consumers;
+  consumers.reserve(kNumConsumers);
+  for (int c = 0; c < kNumConsumers; c++) {
+    consumers.emplace_back([cq, epfd, efd, &completed_ops]() {
+      while (completed_ops.load(std::memory_order_acquire) < kTotalOps) {
+        struct epoll_event out_ev = {};
+        int n = epoll_wait(epfd, &out_ev, 1, 5000);
+        if (n < 0 && errno == EINTR) continue;
+        ASSERT_EQ(n, 1);
+        eventfd_t val = 0;
+        if (eventfd_read(efd, &val) < 0) {
+          ASSERT_EQ(errno, EAGAIN);
+          continue;
+        }
+        for (;;) {
+          grpc_event cq_ev = grpc_completion_queue_next(
+              cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+          if (cq_ev.type == GRPC_OP_COMPLETE) {
+            if (completed_ops.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+                kTotalOps) {
+              (void)eventfd_write(efd, 1);
+            }
+          } else {
+            ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+            break;
+          }
+        }
+        if (completed_ops.load(std::memory_order_acquire) == kTotalOps) {
+          // Cascade wakeup to any remaining sibling consumer in epoll_wait.
+          (void)eventfd_write(efd, 1);
+        }
+      }
+    });
+  }
+
+  std::vector<std::thread> producers;
+  producers.reserve(kNumProducers);
+  for (int p = 0; p < kNumProducers; p++) {
+    producers.emplace_back([cq, p]() {
+      for (int i = 0; i < kOpsPerProducer; i++) {
+        grpc_core::ExecCtx exec_ctx;
+        void* tag = reinterpret_cast<void*>(
+            static_cast<intptr_t>(p * kOpsPerProducer + i + 1));
+        ASSERT_TRUE(grpc_cq_begin_op(cq, tag));
+        grpc_cq_end_op(
+            cq, tag, absl::OkStatus(),
+            [](void* /*arg*/, grpc_cq_completion* c) { delete c; }, nullptr,
+            new grpc_cq_completion());
+      }
+    });
+  }
+
+  for (auto& t : producers) {
+    t.join();
+  }
+  for (auto& t : consumers) {
+    t.join();
+  }
+  ASSERT_EQ(completed_ops.load(), kTotalOps);
+
+  // Clear any residual wakeup written to wake sibling consumers, then verify
+  // concurrent final op completion + shutdown + immediate close(efd) upon
+  // GRPC_QUEUE_SHUTDOWN never writes to a closed/reused descriptor.
+  eventfd_t drain_val = 0;
+  (void)eventfd_read(efd, &drain_val);
+
+  void* final_tag = create_test_tag();
+  ASSERT_TRUE(grpc_cq_begin_op(cq, final_tag));
+  grpc_completion_queue_shutdown(cq);
+
+  std::thread final_producer([cq, final_tag]() {
+    grpc_core::ExecCtx exec_ctx;
+    grpc_cq_end_op(
+        cq, final_tag, absl::OkStatus(),
+        [](void* /*arg*/, grpc_cq_completion* c) { delete c; }, nullptr,
+        new grpc_cq_completion());
+  });
+
+  bool got_final_op = false;
+  bool got_shutdown = false;
+  while (!got_shutdown) {
+    struct epoll_event out_ev = {};
+    int n = epoll_wait(epfd, &out_ev, 1, 5000);
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_EQ(n, 1);
+    eventfd_t val = 0;
+    ASSERT_EQ(eventfd_read(efd, &val), 0);
+    for (;;) {
+      grpc_event cq_ev = grpc_completion_queue_next(
+          cq, gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+      if (cq_ev.type == GRPC_OP_COMPLETE) {
+        ASSERT_EQ(cq_ev.tag, final_tag);
+        got_final_op = true;
+      } else if (cq_ev.type == GRPC_QUEUE_SHUTDOWN) {
+        got_shutdown = true;
+        break;
+      } else {
+        ASSERT_EQ(cq_ev.type, GRPC_QUEUE_TIMEOUT);
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(got_final_op);
+
+  // Immediately close efd before joining final_producer or destroying cq, and
+  // allocate a new eventfd to verify no late write hits the reused fd number.
+  close(epfd);
+  close(efd);
+  int replacement_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  ASSERT_GE(replacement_efd, 0);
+
+  final_producer.join();
+  ASSERT_EQ(grpc_cq_release_eventfd(cq), -1);
+  grpc_completion_queue_destroy(cq);
+
+  eventfd_t rep_val = 0;
+  ASSERT_EQ(eventfd_read(replacement_efd, &rep_val), -1);
+  ASSERT_EQ(errno, EAGAIN);
+  close(replacement_efd);
+}
+#else   // GRPC_LINUX_EVENTFD
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdUnsupported) {
+  ASSERT_EQ(grpc_cq_release_eventfd(nullptr), -1);
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  ASSERT_EQ(grpc_cq_release_eventfd(cq), -1);
+  shutdown_and_destroy(cq);
+}
+#endif  // GRPC_LINUX_EVENTFD
 
 int main(int argc, char** argv) {
   grpc::testing::TestEnvironment env(&argc, argv);

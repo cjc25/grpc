@@ -37,6 +37,7 @@
 #include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/iomgr/pollset.h"
+#include "src/core/lib/iomgr/port.h"
 #include "src/core/lib/surface/event_string.h"
 #include "src/core/telemetry/stats_data.h"
 #include "src/core/util/atomic_utils.h"
@@ -50,6 +51,11 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+
+#ifdef GRPC_LINUX_EVENTFD
+#include <errno.h>
+#include <sys/eventfd.h>
+#endif
 
 namespace {
 
@@ -332,7 +338,30 @@ struct cq_next_data {
 
   /// 0 initially. 1 once we initiated shutdown
   std::atomic<bool> shutdown_called{false};
+
+  /// Optional non-blocking Linux eventfd released to the application via
+  /// grpc_cq_release_eventfd(). -1 if no eventfd has been released.
+  std::atomic<int> eventfd{-1};
 };
+
+void cq_eventfd_notify(cq_next_data* cqd) {
+#ifdef GRPC_LINUX_EVENTFD
+  const int efd = cqd->eventfd.load(std::memory_order_relaxed);
+  if (efd >= 0) {
+    int err;
+    do {
+      err = eventfd_write(efd, 1);
+    } while (err < 0 && errno == EINTR);
+    if (err < 0 && errno != EAGAIN) {
+      LOG(ERROR) << "eventfd_write failed: "
+                 << grpc_core::StatusToString(
+                        GRPC_OS_ERROR(errno, "eventfd_write"));
+    }
+  }
+#else
+  (void)cqd;
+#endif
+}
 
 struct cq_pluck_data {
   cq_pluck_data() {
@@ -792,6 +821,7 @@ static void cq_end_op_for_next(
       // Only kick if this is the first item queued
       if (is_first) {
         gpr_mu_lock(cq->mu);
+        cq_eventfd_notify(cqd);
         grpc_error_handle kick_error =
             cq->poller_vtable->kick(POLLSET_FROM_CQ(cq), nullptr);
         gpr_mu_unlock(cq->mu);
@@ -810,8 +840,8 @@ static void cq_end_op_for_next(
       }
     } else {
       GRPC_CQ_INTERNAL_REF(cq, "shutting_down");
-      cqd->pending_events.store(0, std::memory_order_release);
       gpr_mu_lock(cq->mu);
+      cqd->pending_events.store(0, std::memory_order_release);
       cq_finish_shutdown_next(cq);
       gpr_mu_unlock(cq->mu);
       GRPC_CQ_INTERNAL_UNREF(cq, "shutting_down");
@@ -1101,7 +1131,16 @@ static grpc_event cq_next(grpc_completion_queue* cq, gpr_timespec deadline,
   if (cqd->queue.num_items() > 0 &&
       cqd->pending_events.load(std::memory_order_acquire) > 0) {
     gpr_mu_lock(cq->mu);
+    if (ret.type == GRPC_QUEUE_TIMEOUT) {
+      cq_eventfd_notify(cqd);
+    }
     (void)cq->poller_vtable->kick(POLLSET_FROM_CQ(cq), nullptr);
+    gpr_mu_unlock(cq->mu);
+  }
+  if (ret.type == GRPC_QUEUE_SHUTDOWN &&
+      GPR_UNLIKELY(cqd->eventfd.load(std::memory_order_relaxed) >= 0)) {
+    gpr_mu_lock(cq->mu);
+    cqd->eventfd.store(-2, std::memory_order_relaxed);
     gpr_mu_unlock(cq->mu);
   }
 
@@ -1125,6 +1164,7 @@ static void cq_finish_shutdown_next(grpc_completion_queue* cq) {
   GRPC_CHECK(cqd->shutdown_called.load(std::memory_order_acquire));
   GRPC_CHECK_EQ(cqd->pending_events.load(std::memory_order_relaxed), 0);
 
+  cq_eventfd_notify(cqd);
   cq->poller_vtable->shutdown(POLLSET_FROM_CQ(cq), &cq->pollset_shutdown_done);
 }
 
@@ -1436,6 +1476,15 @@ void grpc_completion_queue_destroy(grpc_completion_queue* cq) {
   GRPC_TRACE_LOG(api, INFO) << "grpc_completion_queue_destroy(cq=" << cq << ")";
   grpc_completion_queue_shutdown(cq);
 
+  if (cq->vtable->cq_completion_type == GRPC_CQ_NEXT) {
+    cq_next_data* cqd = static_cast<cq_next_data*> DATA_FROM_CQ(cq);
+    if (GPR_UNLIKELY(cqd->eventfd.load(std::memory_order_relaxed) >= 0)) {
+      gpr_mu_lock(cq->mu);
+      cqd->eventfd.store(-2, std::memory_order_relaxed);
+      gpr_mu_unlock(cq->mu);
+    }
+  }
+
   grpc_core::ExecCtx exec_ctx;
   GRPC_CQ_INTERNAL_UNREF(cq, "destroy");
 }
@@ -1446,4 +1495,34 @@ grpc_pollset* grpc_cq_pollset(grpc_completion_queue* cq) {
 
 bool grpc_cq_can_listen(grpc_completion_queue* cq) {
   return cq->poller_vtable->can_listen;
+}
+
+int grpc_cq_release_eventfd(grpc_completion_queue* cq) {
+  if (cq == nullptr || cq->vtable->cq_completion_type != GRPC_CQ_NEXT) {
+    return -1;
+  }
+#ifdef GRPC_LINUX_EVENTFD
+  cq_next_data* cqd = static_cast<cq_next_data*> DATA_FROM_CQ(cq);
+  gpr_mu_lock(cq->mu);
+  if (cqd->eventfd.load(std::memory_order_relaxed) != -1) {
+    gpr_mu_unlock(cq->mu);
+    return -1;
+  }
+  const int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (efd < 0) {
+    gpr_mu_unlock(cq->mu);
+    LOG(ERROR) << "eventfd creation failed: "
+               << grpc_core::StatusToString(GRPC_OS_ERROR(errno, "eventfd"));
+    return -1;
+  }
+  cqd->eventfd.store(efd, std::memory_order_relaxed);
+  if (cqd->queue.num_items() > 0 ||
+      cqd->pending_events.load(std::memory_order_acquire) == 0) {
+    cq_eventfd_notify(cqd);
+  }
+  gpr_mu_unlock(cq->mu);
+  return efd;
+#else
+  return -1;
+#endif
 }
