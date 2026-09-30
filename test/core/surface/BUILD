@@ -87,6 +87,7 @@ grpc_cc_test(
         "//:grpc",
         "//:grpc_base",
         "//src/core:event_engine_shim",
+        "//src/core:iomgr_port",
         "//src/core:useful",
         "//test/core/test_util:grpc_test_util",
     ],

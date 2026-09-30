@@ -2160,6 +2160,7 @@ grpc_cc_library(
         "//src/core:inter_activity_latch",
         "//src/core:inter_activity_pipe",
         "//src/core:iomgr_fwd",
+        "//src/core:iomgr_port",
         "//src/core:latch",
         "//src/core:latent_see",
         "//src/core:loop",
