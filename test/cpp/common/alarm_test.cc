@@ -24,9 +24,17 @@
 #include <mutex>
 #include <thread>
 
+#include "src/core/lib/iomgr/port.h"
 #include "src/core/util/notification.h"
 #include "test/core/test_util/test_config.h"
 #include "gtest/gtest.h"
+
+#ifdef GRPC_LINUX_EVENTFD
+#include <errno.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+#endif
 
 namespace grpc {
 namespace {
@@ -461,6 +469,134 @@ TEST(AlarmTest, CallbackSetInCallback) {
   std::unique_lock<std::mutex> l(c.mu);
   c.cv.wait(l, [&] { return c.completed; });
 }
+
+#ifdef GRPC_LINUX_EVENTFD
+TEST(AlarmTest, ReleaseEventFdMultiplexing) {
+  CompletionQueue cq1;
+  CompletionQueue cq2;
+  const int efd1 = cq1.ReleaseEventFd();
+  const int efd2 = cq2.ReleaseEventFd();
+  ASSERT_GE(efd1, 0);
+  ASSERT_GE(efd2, 0);
+  EXPECT_EQ(cq1.ReleaseEventFd(), -1);
+
+  const int custom_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  ASSERT_GE(custom_efd, 0);
+
+  const int epfd = epoll_create1(EPOLL_CLOEXEC);
+  ASSERT_GE(epfd, 0);
+
+  auto add_to_epoll = [epfd](int fd) {
+    struct epoll_event ev = {};
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev), 0);
+  };
+  add_to_epoll(efd1);
+  add_to_epoll(efd2);
+  add_to_epoll(custom_efd);
+
+  void* tag1a = reinterpret_cast<void*>(101);
+  void* tag1b = reinterpret_cast<void*>(102);
+  void* tag2 = reinterpret_cast<void*>(202);
+  Alarm alarm1a;
+  Alarm alarm1b;
+  Alarm alarm2;
+  alarm1a.Set(&cq1, gpr_inf_past(GPR_CLOCK_REALTIME), tag1a);
+  alarm1b.Set(&cq1, gpr_inf_past(GPR_CLOCK_REALTIME), tag1b);
+  alarm2.Set(&cq2,
+             std::chrono::system_clock::now() + std::chrono::milliseconds(50),
+             tag2);
+  ASSERT_EQ(eventfd_write(custom_efd, 1), 0);
+
+  bool got_tag1a = false;
+  bool got_tag1b = false;
+  bool got_tag2 = false;
+  bool got_custom = false;
+  while (!got_tag1a || !got_tag1b || !got_tag2 || !got_custom) {
+    struct epoll_event events[3];
+    int n = epoll_wait(epfd, events, 3, 5000);
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_GT(n, 0);
+    for (int i = 0; i < n; i++) {
+      const int fd = events[i].data.fd;
+      eventfd_t val = 0;
+      ASSERT_EQ(eventfd_read(fd, &val), 0);
+      if (fd == custom_efd) {
+        got_custom = true;
+      } else {
+        CompletionQueue* cq = (fd == efd1) ? &cq1 : &cq2;
+        for (;;) {
+          void* output_tag = nullptr;
+          bool ok = false;
+          const CompletionQueue::NextStatus status =
+              cq->AsyncNext(&output_tag, &ok, gpr_time_0(GPR_CLOCK_REALTIME));
+          if (status == CompletionQueue::TIMEOUT) {
+            break;
+          }
+          ASSERT_EQ(status, CompletionQueue::GOT_EVENT);
+          EXPECT_TRUE(ok);
+          if (fd == efd1) {
+            if (output_tag == tag1a) {
+              got_tag1a = true;
+            } else if (output_tag == tag1b) {
+              got_tag1b = true;
+            } else {
+              FAIL() << "Unexpected tag on cq1: " << output_tag;
+            }
+          } else {
+            EXPECT_EQ(output_tag, tag2);
+            got_tag2 = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Shutdown both CompletionQueues and verify epoll_wait wakes up for SHUTDOWN.
+  cq1.Shutdown();
+  cq2.Shutdown();
+  bool cq1_shutdown = false;
+  bool cq2_shutdown = false;
+  while (!cq1_shutdown || !cq2_shutdown) {
+    struct epoll_event events[2];
+    int n = epoll_wait(epfd, events, 2, 5000);
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_GT(n, 0);
+    for (int i = 0; i < n; i++) {
+      const int fd = events[i].data.fd;
+      eventfd_t val = 0;
+      ASSERT_EQ(eventfd_read(fd, &val), 0);
+      CompletionQueue* cq = (fd == efd1) ? &cq1 : &cq2;
+      void* output_tag = nullptr;
+      bool ok = false;
+      const CompletionQueue::NextStatus status =
+          cq->AsyncNext(&output_tag, &ok, gpr_time_0(GPR_CLOCK_REALTIME));
+      ASSERT_EQ(status, CompletionQueue::SHUTDOWN);
+      if (fd == efd1) {
+        cq1_shutdown = true;
+      } else {
+        cq2_shutdown = true;
+      }
+    }
+  }
+
+  close(epfd);
+  close(custom_efd);
+  close(efd1);
+  close(efd2);
+}
+#else   // GRPC_LINUX_EVENTFD
+TEST(AlarmTest, ReleaseEventFdUnsupported) {
+  CompletionQueue cq;
+  EXPECT_EQ(cq.ReleaseEventFd(), -1);
+  cq.Shutdown();
+  void* tag = nullptr;
+  bool ok = false;
+  EXPECT_EQ(cq.AsyncNext(&tag, &ok, gpr_inf_future(GPR_CLOCK_REALTIME)),
+            CompletionQueue::SHUTDOWN);
+}
+#endif  // GRPC_LINUX_EVENTFD
 
 }  // namespace
 }  // namespace grpc
