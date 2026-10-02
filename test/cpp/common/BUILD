@@ -28,11 +28,14 @@ grpc_cc_test(
     name = "alarm_test",
     srcs = ["alarm_test.cc"],
     external_deps = [
+        "absl/status",
         "gtest",
     ],
     tags = ["no_windows"],  # TODO(jtattermusch): fix test on windows RBE
     deps = [
+        "//:exec_ctx",
         "//:grpc++_unsecure",
+        "//:grpc_base",
         "//src/core:iomgr_port",
         "//src/core:notification",
         "//test/core/test_util:grpc_test_util_base",

@@ -43,6 +43,7 @@
 #include <grpcpp/impl/sync.h>
 #include <grpcpp/support/status.h>
 
+#include <cstddef>
 #include <list>
 
 #include "absl/log/absl_check.h"
@@ -201,6 +202,39 @@ class CompletionQueue : private grpc::internal::GrpcLibrary {
     return AsyncNextInternal(tag, ok, deadline_tp.raw_time());
   }
 
+  /// Read up to \a max_events events from the queue, blocking up to
+  /// \a deadline (or the queue's shutdown) only if no user-visible events are
+  /// immediately available.
+  ///
+  /// Upon returning \a NextStatus::GOT_EVENT, \a *num_events is set to the
+  /// number of events populated in \a tags and \a oks (`1 <= *num_events <=
+  /// max_events`), and `tags[0 .. *num_events - 1]` and
+  /// `oks[0 .. *num_events - 1]` contain each event's tag and success status.
+  /// Upon returning \a NextStatus::TIMEOUT or \a NextStatus::SHUTDOWN,
+  /// \a *num_events is set to 0.
+  ///
+  /// \param[out] tags Caller-allocated array of at least \a max_events entries
+  ///        updated with the tags of retrieved events.
+  /// \param[out] oks Caller-allocated array of at least \a max_events entries
+  ///        updated with the success status of each retrieved event.
+  ///        See documentation for CompletionQueue::Next for explanation of ok.
+  /// \param[in] max_events Maximum number of events to retrieve (capacity of
+  ///        \a tags and \a oks). If 0, returns \a NextStatus::TIMEOUT
+  ///        immediately with `*num_events == 0`.
+  /// \param[out] num_events Updated to the number of events written to \a tags
+  ///        and \a oks (0 on \a NextStatus::TIMEOUT or
+  ///        \a NextStatus::SHUTDOWN).
+  /// \param[in] deadline How long to block in wait for the first event.
+  ///
+  /// \return The status of the batch read.
+  template <typename T>
+  NextStatus AsyncNext(void** tags, bool* oks, size_t max_events,
+                       size_t* num_events, const T& deadline) {
+    grpc::TimePoint<T> deadline_tp(deadline);
+    return AsyncNextInternal(tags, oks, max_events, num_events,
+                             deadline_tp.raw_time());
+  }
+
   /// EXPERIMENTAL
   /// First executes \a F, then reads from the queue, blocking up to
   /// \a deadline (or the queue's shutdown).
@@ -335,6 +369,8 @@ class CompletionQueue : private grpc::internal::GrpcLibrary {
   };
 
   NextStatus AsyncNextInternal(void** tag, bool* ok, gpr_timespec deadline);
+  NextStatus AsyncNextInternal(void** tags, bool* oks, size_t max_events,
+                               size_t* num_events, gpr_timespec deadline);
 
   /// Wraps \a grpc_completion_queue_pluck.
   /// \warning Must not be mixed with calls to \a Next.
