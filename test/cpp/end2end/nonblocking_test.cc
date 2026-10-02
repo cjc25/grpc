@@ -376,9 +376,9 @@ TEST_F(NonblockingTest, EpollEventFdRpcBatchedAsyncNext) {
         void* batch_tags[kBatchSize] = {};
         bool batch_oks[kBatchSize] = {};
         size_t batch_count = 0;
-        auto r = ready_cq->AsyncNext(batch_tags, batch_oks, kBatchSize,
-                                     &batch_count,
-                                     gpr_time_0(GPR_CLOCK_REALTIME));
+        auto r =
+            ready_cq->AsyncNext(batch_tags, batch_oks, kBatchSize, &batch_count,
+                                gpr_time_0(GPR_CLOCK_REALTIME));
         if (r == CompletionQueue::TIMEOUT) {
           GRPC_CHECK_EQ(batch_count, 0u);
           break;
@@ -391,8 +391,7 @@ TEST_F(NonblockingTest, EpollEventFdRpcBatchedAsyncNext) {
         GRPC_CHECK_EQ(r, CompletionQueue::GOT_EVENT);
         GRPC_CHECK_GE(batch_count, 1u);
         for (size_t i = 0; i < batch_count; i++) {
-          drained_events.push_back(
-              {ready_cq, r, batch_tags[i], batch_oks[i]});
+          drained_events.push_back({ready_cq, r, batch_tags[i], batch_oks[i]});
         }
       }
       g_is_nonblocking_poll = orig_val;
