@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -302,6 +303,7 @@ class CqEventQueue {
 
   bool Push(grpc_cq_completion* c);
   grpc_cq_completion* Pop();
+  size_t PopBatch(grpc_cq_completion** completions, size_t max_completions);
 
  private:
   // Spinlock to serialize consumers i.e pop() operations
@@ -581,18 +583,32 @@ bool CqEventQueue::Push(grpc_cq_completion* c) {
 
 grpc_cq_completion* CqEventQueue::Pop() {
   grpc_cq_completion* c = nullptr;
+  PopBatch(&c, 1);
+  return c;
+}
 
-  if (gpr_spinlock_trylock(&queue_lock_)) {
-    bool is_empty = false;
-    c = reinterpret_cast<grpc_cq_completion*>(queue_.PopAndCheckEnd(&is_empty));
+size_t CqEventQueue::PopBatch(grpc_cq_completion** completions,
+                              size_t max_completions) {
+  size_t count = 0;
+  if (GPR_LIKELY(max_completions > 0) && gpr_spinlock_trylock(&queue_lock_)) {
+    while (count < max_completions) {
+      bool is_empty = false;
+      grpc_cq_completion* c = reinterpret_cast<grpc_cq_completion*>(
+          queue_.PopAndCheckEnd(&is_empty));
+      if (c == nullptr) {
+        break;
+      }
+      completions[count++] = c;
+    }
     gpr_spinlock_unlock(&queue_lock_);
   }
 
-  if (c) {
-    num_queue_items_.fetch_sub(1, std::memory_order_relaxed);
+  if (count > 0) {
+    num_queue_items_.fetch_sub(static_cast<intptr_t>(count),
+                               std::memory_order_relaxed);
   }
 
-  return c;
+  return count;
 }
 
 grpc_completion_queue* grpc_completion_queue_create_internal(
@@ -1021,25 +1037,35 @@ static void dump_pending_tags(grpc_completion_queue* cq) {
 static void dump_pending_tags(grpc_completion_queue* /*cq*/) {}
 #endif
 
-static grpc_event cq_next(grpc_completion_queue* cq, gpr_timespec deadline,
-                          void* reserved) {
-  grpc_event ret;
+static grpc_completion_type cq_next_batch(grpc_completion_queue* cq,
+                                          grpc_event* events, size_t max_events,
+                                          size_t* num_events,
+                                          gpr_timespec deadline,
+                                          void* reserved) {
   cq_next_data* cqd = static_cast<cq_next_data*> DATA_FROM_CQ(cq);
 
-  GRPC_TRACE_LOG(api, INFO)
-      << "grpc_completion_queue_next(cq=" << cq
-      << ", deadline=gpr_timespec { tv_sec: " << deadline.tv_sec
-      << ", tv_nsec: " << deadline.tv_nsec
-      << ", clock_type: " << (int)deadline.clock_type
-      << " }, reserved=" << reserved << ")";
   GRPC_CHECK(!reserved);
+  GRPC_CHECK_NE(num_events, nullptr);
+  *num_events = 0;
+  if (GPR_UNLIKELY(max_events == 0)) {
+    return GRPC_QUEUE_TIMEOUT;
+  }
+  GRPC_CHECK_NE(events, nullptr);
 
   dump_pending_tags(cq);
 
   GRPC_CQ_INTERNAL_REF(cq, "next");
 
-  grpc_core::Timestamp deadline_millis =
-      grpc_core::Timestamp::FromTimespecRoundUp(deadline);
+  grpc_cq_completion* inline_completions[64];
+  std::unique_ptr<grpc_cq_completion*[]> heap_completions;
+  grpc_cq_completion** completions = inline_completions;
+  if (GPR_UNLIKELY(max_events > GPR_ARRAY_SIZE(inline_completions))) {
+    heap_completions = std::make_unique<grpc_cq_completion*[]>(max_events);
+    completions = heap_completions.get();
+  }
+
+  bool deadline_initialized = false;
+  grpc_core::Timestamp deadline_millis = grpc_core::Timestamp::InfFuture();
   cq_is_finished_arg is_finished_arg = {
       cqd->things_queued_ever.load(std::memory_order_relaxed),
       cq,
@@ -1048,36 +1074,29 @@ static grpc_event cq_next(grpc_completion_queue* cq, gpr_timespec deadline,
       nullptr,
       true};
   ExecCtxNext exec_ctx(&is_finished_arg);
+  grpc_completion_type ret_type = GRPC_QUEUE_TIMEOUT;
   for (;;) {
-    grpc_core::Timestamp iteration_deadline = deadline_millis;
-
+    size_t count = 0;
     if (is_finished_arg.stolen_completion != nullptr) {
-      grpc_cq_completion* c = is_finished_arg.stolen_completion;
+      completions[0] = is_finished_arg.stolen_completion;
       is_finished_arg.stolen_completion = nullptr;
-      ret.type = GRPC_OP_COMPLETE;
-      ret.success = c->next & 1u;
-      ret.tag = c->tag;
-      c->done(c->done_arg, c);
-      break;
+      count = 1 + cqd->queue.PopBatch(completions + 1, max_events - 1);
+    } else {
+      count = cqd->queue.PopBatch(completions, max_events);
     }
 
-    grpc_cq_completion* c = cqd->queue.Pop();
-
-    if (c != nullptr) {
-      ret.type = GRPC_OP_COMPLETE;
-      ret.success = c->next & 1u;
-      ret.tag = c->tag;
-      c->done(c->done_arg, c);
-      break;
-    } else {
-      // If c == NULL it means either the queue is empty OR in an transient
-      // inconsistent state. If it is the latter, we should do a 0-timeout poll
-      // so that the thread comes back quickly from poll to make a second
-      // attempt at popping. Not doing this can potentially deadlock this
-      // thread forever (if the deadline is infinity)
-      if (cqd->queue.num_items() > 0) {
-        iteration_deadline = grpc_core::Timestamp::ProcessEpoch();
+    if (count > 0) {
+      exec_ctx.SetReadyToFinishFlag();
+      for (size_t i = 0; i < count; i++) {
+        grpc_cq_completion* c = completions[i];
+        events[i].type = GRPC_OP_COMPLETE;
+        events[i].success = c->next & 1u;
+        events[i].tag = c->tag;
+        c->done(c->done_arg, c);
       }
+      *num_events = count;
+      ret_type = GRPC_OP_COMPLETE;
+      break;
     }
 
     if (cqd->pending_events.load(std::memory_order_acquire) == 0) {
@@ -1093,18 +1112,31 @@ static grpc_event cq_next(grpc_completion_queue* cq, gpr_timespec deadline,
         continue;
       }
 
-      ret.type = GRPC_QUEUE_SHUTDOWN;
-      ret.success = 0;
+      ret_type = GRPC_QUEUE_SHUTDOWN;
       break;
+    }
+
+    if (!deadline_initialized) {
+      deadline_millis = grpc_core::Timestamp::FromTimespecRoundUp(deadline);
+      is_finished_arg.deadline = deadline_millis;
+      deadline_initialized = true;
     }
 
     if (!is_finished_arg.first_loop &&
         grpc_core::Timestamp::Now() >= deadline_millis) {
-      ret.type = GRPC_QUEUE_TIMEOUT;
-      ret.success = 0;
+      ret_type = GRPC_QUEUE_TIMEOUT;
       dump_pending_tags(cq);
       break;
     }
+
+    // If PopBatch returned 0 it means either the queue is empty OR in an
+    // transient inconsistent state. If it is the latter, we should do a
+    // 0-timeout poll so that the thread comes back quickly from poll to make a
+    // second attempt at popping. Not doing this can potentially deadlock this
+    // thread forever (if the deadline is infinity)
+    grpc_core::Timestamp iteration_deadline =
+        cqd->queue.num_items() > 0 ? grpc_core::Timestamp::ProcessEpoch()
+                                   : deadline_millis;
 
     // The main polling work happens in grpc_pollset_work
     gpr_mu_lock(cq->mu);
@@ -1117,38 +1149,68 @@ static grpc_event cq_next(grpc_completion_queue* cq, gpr_timespec deadline,
       LOG(ERROR) << "Completion queue next failed: "
                  << grpc_core::StatusToString(err);
       if (err == absl::CancelledError()) {
-        ret.type = GRPC_QUEUE_SHUTDOWN;
+        ret_type = GRPC_QUEUE_SHUTDOWN;
       } else {
-        ret.type = GRPC_QUEUE_TIMEOUT;
+        ret_type = GRPC_QUEUE_TIMEOUT;
       }
-      ret.success = 0;
       dump_pending_tags(cq);
       break;
     }
     is_finished_arg.first_loop = false;
   }
 
+  exec_ctx.SetReadyToFinishFlag();
+
   if (cqd->queue.num_items() > 0 &&
       cqd->pending_events.load(std::memory_order_acquire) > 0) {
     gpr_mu_lock(cq->mu);
-    if (ret.type == GRPC_QUEUE_TIMEOUT) {
+    if (ret_type == GRPC_QUEUE_TIMEOUT) {
       cq_eventfd_notify(cqd);
     }
     (void)cq->poller_vtable->kick(POLLSET_FROM_CQ(cq), nullptr);
     gpr_mu_unlock(cq->mu);
   }
-  if (ret.type == GRPC_QUEUE_SHUTDOWN &&
+  if (ret_type == GRPC_QUEUE_SHUTDOWN &&
       GPR_UNLIKELY(cqd->eventfd.load(std::memory_order_relaxed) >= 0)) {
     gpr_mu_lock(cq->mu);
     cqd->eventfd.store(-2, std::memory_order_relaxed);
     gpr_mu_unlock(cq->mu);
   }
 
-  GRPC_SURFACE_TRACE_RETURNED_EVENT(cq, &ret);
+  if (GRPC_TRACE_FLAG_ENABLED(api)) {
+    if (ret_type == GRPC_OP_COMPLETE) {
+      for (size_t i = 0; i < *num_events; i++) {
+        GRPC_SURFACE_TRACE_RETURNED_EVENT(cq, &events[i]);
+      }
+    } else {
+      grpc_event ret_ev{ret_type, 0, nullptr};
+      GRPC_SURFACE_TRACE_RETURNED_EVENT(cq, &ret_ev);
+    }
+  }
   GRPC_CQ_INTERNAL_UNREF(cq, "next");
 
   GRPC_CHECK_EQ(is_finished_arg.stolen_completion, nullptr);
 
+  return ret_type;
+}
+
+static grpc_event cq_next(grpc_completion_queue* cq, gpr_timespec deadline,
+                          void* reserved) {
+  GRPC_TRACE_LOG(api, INFO)
+      << "grpc_completion_queue_next(cq=" << cq
+      << ", deadline=gpr_timespec { tv_sec: " << deadline.tv_sec
+      << ", tv_nsec: " << deadline.tv_nsec
+      << ", clock_type: " << (int)deadline.clock_type
+      << " }, reserved=" << reserved << ")";
+  grpc_event ret;
+  size_t num_events = 0;
+  grpc_completion_type type =
+      cq_next_batch(cq, &ret, 1, &num_events, deadline, reserved);
+  if (type != GRPC_OP_COMPLETE) {
+    ret.type = type;
+    ret.success = 0;
+    ret.tag = nullptr;
+  }
   return ret;
 }
 
@@ -1201,6 +1263,20 @@ static void cq_shutdown_next(grpc_completion_queue* cq) {
 grpc_event grpc_completion_queue_next(grpc_completion_queue* cq,
                                       gpr_timespec deadline, void* reserved) {
   return cq->vtable->next(cq, deadline, reserved);
+}
+
+grpc_completion_type grpc_cq_next_batch(grpc_completion_queue* cq,
+                                        grpc_event* events, size_t max_events,
+                                        size_t* num_events,
+                                        gpr_timespec deadline, void* reserved) {
+  GRPC_TRACE_LOG(api, INFO)
+      << "grpc_cq_next_batch(cq=" << cq << ", max_events=" << max_events
+      << ", deadline=gpr_timespec { tv_sec: " << deadline.tv_sec
+      << ", tv_nsec: " << deadline.tv_nsec
+      << ", clock_type: " << (int)deadline.clock_type
+      << " }, reserved=" << reserved << ")";
+  GRPC_CHECK_EQ(cq->vtable->cq_completion_type, GRPC_CQ_NEXT);
+  return cq_next_batch(cq, events, max_events, num_events, deadline, reserved);
 }
 
 static int add_plucker(grpc_completion_queue* cq, void* tag,

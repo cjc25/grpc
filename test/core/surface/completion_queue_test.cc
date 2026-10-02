@@ -23,7 +23,10 @@
 #include <grpc/support/time.h>
 #include <stddef.h>
 
+#include <atomic>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #include "src/core/lib/event_engine/shim.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
@@ -39,10 +42,6 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-
-#include <atomic>
-#include <thread>
-#include <vector>
 #endif
 
 #define LOG_TEST(x) LOG(INFO) << x
@@ -974,6 +973,91 @@ TEST(GrpcCompletionQueueTest,
   ASSERT_EQ(errno, EAGAIN);
   close(replacement_efd);
 }
+
+TEST(GrpcCompletionQueueTest, TestReleaseEventFdWithNextBatch) {
+  constexpr int kNumProducers = 4;
+  constexpr int kOpsPerProducer = 200;
+  constexpr int kTotalOps = kNumProducers * kOpsPerProducer;
+  constexpr size_t kBatchSize = 16;
+
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  int efd = grpc_cq_release_eventfd(cq);
+  ASSERT_GE(efd, 0);
+
+  int epfd = epoll_create1(EPOLL_CLOEXEC);
+  ASSERT_GE(epfd, 0);
+  struct epoll_event ev = {};
+  ev.events = EPOLLIN;
+  ev.data.fd = efd;
+  ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev), 0);
+
+  std::vector<std::thread> producers;
+  producers.reserve(kNumProducers);
+  for (int p = 0; p < kNumProducers; p++) {
+    producers.emplace_back([cq, p]() {
+      for (int i = 0; i < kOpsPerProducer; i++) {
+        grpc_core::ExecCtx exec_ctx;
+        void* tag = reinterpret_cast<void*>(
+            static_cast<intptr_t>(p * kOpsPerProducer + i + 1));
+        ASSERT_TRUE(grpc_cq_begin_op(cq, tag));
+        grpc_cq_end_op(
+            cq, tag, absl::OkStatus(),
+            [](void* /*arg*/, grpc_cq_completion* c) { delete c; }, nullptr,
+            new grpc_cq_completion());
+      }
+    });
+  }
+
+  std::thread shutdown_thread([cq, &producers]() {
+    for (auto& t : producers) {
+      t.join();
+    }
+    grpc_completion_queue_shutdown(cq);
+  });
+
+  int completed_ops = 0;
+  bool got_shutdown = false;
+  while (!got_shutdown) {
+    struct epoll_event out_ev = {};
+    int n = epoll_wait(epfd, &out_ev, 1, 5000);
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_EQ(n, 1);
+    eventfd_t val = 0;
+    ASSERT_EQ(eventfd_read(efd, &val), 0);
+
+    for (;;) {
+      grpc_event batch[kBatchSize];
+      size_t num_events = 0;
+      grpc_completion_type type =
+          grpc_cq_next_batch(cq, batch, kBatchSize, &num_events,
+                             gpr_inf_past(GPR_CLOCK_REALTIME), nullptr);
+      if (type == GRPC_OP_COMPLETE) {
+        ASSERT_GE(num_events, 1u);
+        ASSERT_LE(num_events, kBatchSize);
+        for (size_t i = 0; i < num_events; i++) {
+          ASSERT_EQ(batch[i].type, GRPC_OP_COMPLETE);
+          ASSERT_EQ(batch[i].success, 1);
+          completed_ops++;
+        }
+      } else if (type == GRPC_QUEUE_SHUTDOWN) {
+        ASSERT_EQ(num_events, 0u);
+        got_shutdown = true;
+        break;
+      } else {
+        ASSERT_EQ(type, GRPC_QUEUE_TIMEOUT);
+        ASSERT_EQ(num_events, 0u);
+        break;
+      }
+    }
+  }
+
+  shutdown_thread.join();
+  ASSERT_EQ(completed_ops, kTotalOps);
+
+  grpc_completion_queue_destroy(cq);
+  close(epfd);
+  close(efd);
+}
 #else   // GRPC_LINUX_EVENTFD
 TEST(GrpcCompletionQueueTest, TestReleaseEventFdUnsupported) {
   ASSERT_EQ(grpc_cq_release_eventfd(nullptr), -1);
@@ -982,6 +1066,282 @@ TEST(GrpcCompletionQueueTest, TestReleaseEventFdUnsupported) {
   shutdown_and_destroy(cq);
 }
 #endif  // GRPC_LINUX_EVENTFD
+
+TEST(GrpcCompletionQueueTest, TestNextBatchBasicAndMultiBatch) {
+  grpc_cq_polling_type polling_types[] = {
+      GRPC_CQ_DEFAULT_POLLING, GRPC_CQ_NON_LISTENING, GRPC_CQ_NON_POLLING};
+  for (size_t pidx = 0; pidx < GPR_ARRAY_SIZE(polling_types); pidx++) {
+    grpc_core::ExecCtx exec_ctx;
+    grpc_completion_queue_attributes attr = {};
+    attr.version = 1;
+    attr.cq_completion_type = GRPC_CQ_NEXT;
+    attr.cq_polling_type = polling_types[pidx];
+    grpc_completion_queue* cq = grpc_completion_queue_create(
+        grpc_completion_queue_factory_lookup(&attr), &attr, nullptr);
+
+    grpc_event events[16];
+    size_t num_events = 99;
+
+    // 1. Empty queue returns GRPC_QUEUE_TIMEOUT and sets num_events to 0.
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 16, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_QUEUE_TIMEOUT);
+    ASSERT_EQ(num_events, 0u);
+
+    // 2. Partial batch (5 items into capacity 16) with mixed success/error,
+    //    plus verifying max_events == 0 does not consume queued items.
+    void* partial_tags[5];
+    grpc_cq_completion partial_comps[5];
+    for (int i = 0; i < 5; i++) {
+      partial_tags[i] = create_test_tag();
+      ASSERT_TRUE(grpc_cq_begin_op(cq, partial_tags[i]));
+      grpc_cq_end_op(
+          cq, partial_tags[i],
+          (i % 2 == 0) ? absl::OkStatus() : absl::InternalError("fail"),
+          do_nothing_end_completion, nullptr, &partial_comps[i]);
+    }
+
+    num_events = 99;
+    ASSERT_EQ(grpc_cq_next_batch(cq, nullptr, 0, &num_events,
+                                 gpr_inf_future(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_QUEUE_TIMEOUT);
+    ASSERT_EQ(num_events, 0u);
+
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 16, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_OP_COMPLETE);
+    ASSERT_EQ(num_events, 5u);
+    for (int i = 0; i < 5; i++) {
+      ASSERT_EQ(events[i].type, GRPC_OP_COMPLETE);
+      ASSERT_EQ(events[i].tag, partial_tags[i]);
+      ASSERT_EQ(events[i].success, (i % 2 == 0) ? 1 : 0);
+    }
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 16, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_QUEUE_TIMEOUT);
+    ASSERT_EQ(num_events, 0u);
+
+    // 3. Multi-batch drain (20 items drained with max_events = 8 -> 8, 8, 4).
+    void* multi_tags[20];
+    grpc_cq_completion multi_comps[20];
+    for (int i = 0; i < 20; i++) {
+      multi_tags[i] = create_test_tag();
+      ASSERT_TRUE(grpc_cq_begin_op(cq, multi_tags[i]));
+      grpc_cq_end_op(cq, multi_tags[i], absl::OkStatus(),
+                     do_nothing_end_completion, nullptr, &multi_comps[i]);
+    }
+    const size_t expected_counts[3] = {8, 8, 4};
+    size_t seen = 0;
+    for (int b = 0; b < 3; b++) {
+      ASSERT_EQ(grpc_cq_next_batch(cq, events, 8, &num_events,
+                                   gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+                GRPC_OP_COMPLETE);
+      ASSERT_EQ(num_events, expected_counts[b]);
+      for (size_t i = 0; i < num_events; i++) {
+        ASSERT_EQ(events[i].type, GRPC_OP_COMPLETE);
+        ASSERT_EQ(events[i].tag, multi_tags[seen + i]);
+        ASSERT_EQ(events[i].success, 1);
+      }
+      seen += num_events;
+    }
+    ASSERT_EQ(seen, 20u);
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 8, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_QUEUE_TIMEOUT);
+    ASSERT_EQ(num_events, 0u);
+
+    // 4. Completion done() callback enqueuing a follow-up completion and
+    //    querying ExecCtx::Get()->IsReadyToFinish() must not trigger
+    //    ExecCtxNext::CheckReadyToFinish() to steal the newly queued completion
+    //    after the batch pop loop has already completed.
+    struct DoneFollowUpState {
+      grpc_completion_queue* cq;
+      void* follow_up_tag;
+      grpc_cq_completion follow_up_comp;
+      bool ready_to_finish = false;
+    } follow_up_state{cq, create_test_tag(), {}, false};
+    void* trigger_tag = create_test_tag();
+    grpc_cq_completion trigger_comp;
+    ASSERT_TRUE(grpc_cq_begin_op(cq, trigger_tag));
+    ASSERT_TRUE(grpc_cq_begin_op(cq, follow_up_state.follow_up_tag));
+    grpc_cq_end_op(
+        cq, trigger_tag, absl::OkStatus(),
+        [](void* arg, grpc_cq_completion* /*c*/) {
+          auto* st = static_cast<DoneFollowUpState*>(arg);
+          grpc_cq_end_op(st->cq, st->follow_up_tag, absl::OkStatus(),
+                         do_nothing_end_completion, nullptr,
+                         &st->follow_up_comp);
+          st->ready_to_finish = grpc_core::ExecCtx::Get()->IsReadyToFinish();
+        },
+        &follow_up_state, &trigger_comp);
+
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 8, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_OP_COMPLETE);
+    ASSERT_EQ(num_events, 1u);
+    ASSERT_EQ(events[0].tag, trigger_tag);
+    ASSERT_TRUE(follow_up_state.ready_to_finish);
+
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 8, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_OP_COMPLETE);
+    ASSERT_EQ(num_events, 1u);
+    ASSERT_EQ(events[0].tag, follow_up_state.follow_up_tag);
+
+    // 5. Shutdown with remaining items drains items first, then returns
+    //    GRPC_QUEUE_SHUTDOWN with num_events == 0.
+    void* shutdown_tags[3];
+    grpc_cq_completion shutdown_comps[3];
+    for (int i = 0; i < 3; i++) {
+      shutdown_tags[i] = create_test_tag();
+      ASSERT_TRUE(grpc_cq_begin_op(cq, shutdown_tags[i]));
+      grpc_cq_end_op(cq, shutdown_tags[i], absl::OkStatus(),
+                     do_nothing_end_completion, nullptr, &shutdown_comps[i]);
+    }
+    grpc_completion_queue_shutdown(cq);
+
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 16, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_OP_COMPLETE);
+    ASSERT_EQ(num_events, 3u);
+    for (int i = 0; i < 3; i++) {
+      ASSERT_EQ(events[i].tag, shutdown_tags[i]);
+    }
+    num_events = 99;
+    ASSERT_EQ(grpc_cq_next_batch(cq, events, 16, &num_events,
+                                 gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+              GRPC_QUEUE_SHUTDOWN);
+    ASSERT_EQ(num_events, 0u);
+
+    grpc_completion_queue_destroy(cq);
+  }
+}
+
+TEST(GrpcCompletionQueueTest, TestNextBatchBlockingAndLargeCapacity) {
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+
+  // 1. Test max_events > 64 (exercising heap_completions allocation path).
+  constexpr size_t kLargeCount = 100;
+  constexpr size_t kLargeCapacity = 128;
+  std::vector<void*> large_tags(kLargeCount);
+  std::vector<grpc_cq_completion> large_comps(kLargeCount);
+  {
+    grpc_core::ExecCtx exec_ctx;
+    for (size_t i = 0; i < kLargeCount; i++) {
+      large_tags[i] = create_test_tag();
+      ASSERT_TRUE(grpc_cq_begin_op(cq, large_tags[i]));
+      grpc_cq_end_op(cq, large_tags[i], absl::OkStatus(),
+                     do_nothing_end_completion, nullptr, &large_comps[i]);
+    }
+  }
+  std::vector<grpc_event> large_events(kLargeCapacity);
+  size_t num_events = 0;
+  ASSERT_EQ(
+      grpc_cq_next_batch(cq, large_events.data(), kLargeCapacity, &num_events,
+                         gpr_inf_past(GPR_CLOCK_REALTIME), nullptr),
+      GRPC_OP_COMPLETE);
+  ASSERT_EQ(num_events, kLargeCount);
+  for (size_t i = 0; i < kLargeCount; i++) {
+    ASSERT_EQ(large_events[i].tag, large_tags[i]);
+    ASSERT_EQ(large_events[i].success, 1);
+  }
+
+  // 2. Test blocking wait when queue is initially empty and producer pushes a
+  //    burst from another thread.
+  constexpr int kBurstCount = 8;
+  std::thread producer([cq]() {
+    gpr_sleep_until(gpr_time_add(gpr_now(GPR_CLOCK_MONOTONIC),
+                                 gpr_time_from_millis(20, GPR_TIMESPAN)));
+    grpc_core::ExecCtx exec_ctx;
+    for (int i = 0; i < kBurstCount; i++) {
+      void* tag = reinterpret_cast<void*>(static_cast<intptr_t>(i + 1));
+      ASSERT_TRUE(grpc_cq_begin_op(cq, tag));
+      grpc_cq_end_op(
+          cq, tag, absl::OkStatus(),
+          [](void* /*arg*/, grpc_cq_completion* c) { delete c; }, nullptr,
+          new grpc_cq_completion());
+    }
+    grpc_completion_queue_shutdown(cq);
+  });
+
+  int total_drained = 0;
+  for (;;) {
+    grpc_event batch[16];
+    size_t count = 0;
+    grpc_completion_type type = grpc_cq_next_batch(
+        cq, batch, 16, &count, grpc_timeout_seconds_to_deadline(5), nullptr);
+    if (type == GRPC_OP_COMPLETE) {
+      ASSERT_GE(count, 1u);
+      total_drained += static_cast<int>(count);
+    } else {
+      ASSERT_EQ(type, GRPC_QUEUE_SHUTDOWN);
+      ASSERT_EQ(count, 0u);
+      break;
+    }
+  }
+  producer.join();
+  ASSERT_EQ(total_drained, kBurstCount);
+  grpc_completion_queue_destroy(cq);
+
+  // 3. Multi-producer + multi-consumer concurrent batch popping.
+  constexpr int kNumProducers = 4;
+  constexpr int kOpsPerProducer = 200;
+  constexpr int kTotalOps = kNumProducers * kOpsPerProducer;
+  constexpr int kNumConsumers = 4;
+  grpc_completion_queue* mp_cq = grpc_completion_queue_create_for_next(nullptr);
+
+  std::atomic<int> mp_completed{0};
+  std::vector<std::thread> consumers;
+  consumers.reserve(kNumConsumers);
+  for (int c = 0; c < kNumConsumers; c++) {
+    consumers.emplace_back([mp_cq, &mp_completed]() {
+      for (;;) {
+        grpc_event batch[16];
+        size_t count = 0;
+        grpc_completion_type type = grpc_cq_next_batch(
+            mp_cq, batch, 16, &count, grpc_timeout_seconds_to_deadline(5),
+            nullptr);
+        if (type == GRPC_OP_COMPLETE) {
+          ASSERT_GE(count, 1u);
+          ASSERT_LE(count, 16u);
+          mp_completed.fetch_add(static_cast<int>(count),
+                                 std::memory_order_relaxed);
+        } else {
+          ASSERT_EQ(type, GRPC_QUEUE_SHUTDOWN);
+          ASSERT_EQ(count, 0u);
+          break;
+        }
+      }
+    });
+  }
+
+  std::vector<std::thread> producers;
+  producers.reserve(kNumProducers);
+  for (int p = 0; p < kNumProducers; p++) {
+    producers.emplace_back([mp_cq, p]() {
+      for (int i = 0; i < kOpsPerProducer; i++) {
+        grpc_core::ExecCtx exec_ctx;
+        void* tag = reinterpret_cast<void*>(
+            static_cast<intptr_t>(p * kOpsPerProducer + i + 1));
+        ASSERT_TRUE(grpc_cq_begin_op(mp_cq, tag));
+        grpc_cq_end_op(
+            mp_cq, tag, absl::OkStatus(),
+            [](void* /*arg*/, grpc_cq_completion* c) { delete c; }, nullptr,
+            new grpc_cq_completion());
+      }
+    });
+  }
+
+  for (auto& t : producers) {
+    t.join();
+  }
+  grpc_completion_queue_shutdown(mp_cq);
+  for (auto& t : consumers) {
+    t.join();
+  }
+  ASSERT_EQ(mp_completed.load(), kTotalOps);
+  grpc_completion_queue_destroy(mp_cq);
+}
 
 int main(int argc, char** argv) {
   grpc::testing::TestEnvironment env(&argc, argv);
