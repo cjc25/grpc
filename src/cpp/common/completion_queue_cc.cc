@@ -23,6 +23,7 @@
 #include <grpcpp/impl/completion_queue_tag.h>
 #include <grpcpp/impl/grpc_library.h>
 
+#include <memory>
 #include <vector>
 
 #include "src/core/lib/experiments/experiments.h"
@@ -162,6 +163,57 @@ CompletionQueue::NextStatus CompletionQueue::AsyncNextInternal(
           return GOT_EVENT;
         }
         break;
+    }
+  }
+}
+
+CompletionQueue::NextStatus CompletionQueue::AsyncNextInternal(
+    void** tags, bool* oks, size_t max_events, size_t* num_events,
+    gpr_timespec deadline) {
+  GRPC_CHECK_NE(num_events, nullptr);
+  *num_events = 0;
+  if (GPR_UNLIKELY(max_events == 0)) {
+    return TIMEOUT;
+  }
+  GRPC_CHECK_NE(tags, nullptr);
+  GRPC_CHECK_NE(oks, nullptr);
+
+  grpc_event inline_events[64];
+  std::unique_ptr<grpc_event[]> heap_events;
+  grpc_event* events = inline_events;
+  if (GPR_UNLIKELY(max_events > GPR_ARRAY_SIZE(inline_events))) {
+    heap_events = std::make_unique<grpc_event[]>(max_events);
+    events = heap_events.get();
+  }
+
+  for (;;) {
+    size_t raw_count = 0;
+    grpc_completion_type type = grpc_cq_next_batch(
+        cq_, events, max_events, &raw_count, deadline, nullptr);
+    switch (type) {
+      case GRPC_QUEUE_TIMEOUT:
+        return TIMEOUT;
+      case GRPC_QUEUE_SHUTDOWN:
+        return SHUTDOWN;
+      case GRPC_OP_COMPLETE: {
+        size_t out_count = 0;
+        for (size_t i = 0; i < raw_count; i++) {
+          auto* core_cq_tag =
+              static_cast<grpc::internal::CompletionQueueTag*>(events[i].tag);
+          bool ok = events[i].success != 0;
+          void* tag = core_cq_tag;
+          if (core_cq_tag->FinalizeResult(&tag, &ok)) {
+            tags[out_count] = tag;
+            oks[out_count] = ok;
+            out_count++;
+          }
+        }
+        if (out_count > 0) {
+          *num_events = out_count;
+          return GOT_EVENT;
+        }
+        break;
+      }
     }
   }
 }

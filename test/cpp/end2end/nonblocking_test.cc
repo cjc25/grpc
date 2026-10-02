@@ -329,6 +329,158 @@ TEST_F(NonblockingTest, EpollEventFdRpc) {
   close(cli_efd);
   close(srv_efd);
 }
+
+TEST_F(NonblockingTest, EpollEventFdRpcBatchedAsyncNext) {
+  ResetStub();
+
+  CompletionQueue cli_cq;
+  const int srv_efd = cq_->ReleaseEventFd();
+  const int cli_efd = cli_cq.ReleaseEventFd();
+  ASSERT_GE(srv_efd, 0);
+  ASSERT_GE(cli_efd, 0);
+
+  const int epfd = epoll_create1(EPOLL_CLOEXEC);
+  ASSERT_GE(epfd, 0);
+  auto add_to_epoll = [epfd](int fd) {
+    struct epoll_event ev = {};
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev), 0);
+  };
+  add_to_epoll(srv_efd);
+  add_to_epoll(cli_efd);
+
+  struct DrainedEvent {
+    CompletionQueue* cq;
+    CompletionQueue::NextStatus status;
+    void* tag;
+    bool ok;
+  };
+  std::deque<DrainedEvent> drained_events;
+
+  auto wait_next_on_epoll = [epfd, srv_efd, this, &cli_cq, &drained_events](
+                                CompletionQueue** out_cq, void** got_tag,
+                                bool* ok) {
+    while (drained_events.empty()) {
+      struct epoll_event ev = {};
+      int n = epoll_wait(epfd, &ev, 1, 5000);
+      if (n < 0 && errno == EINTR) continue;
+      GRPC_CHECK_GT(n, 0);
+      eventfd_t val = 0;
+      GRPC_CHECK_EQ(eventfd_read(ev.data.fd, &val), 0);
+      CompletionQueue* ready_cq = (ev.data.fd == srv_efd) ? cq_.get() : &cli_cq;
+      bool orig_val = g_is_nonblocking_poll;
+      g_is_nonblocking_poll = true;
+      for (;;) {
+        constexpr size_t kBatchSize = 16;
+        void* batch_tags[kBatchSize] = {};
+        bool batch_oks[kBatchSize] = {};
+        size_t batch_count = 0;
+        auto r = ready_cq->AsyncNext(batch_tags, batch_oks, kBatchSize,
+                                     &batch_count,
+                                     gpr_time_0(GPR_CLOCK_REALTIME));
+        if (r == CompletionQueue::TIMEOUT) {
+          GRPC_CHECK_EQ(batch_count, 0u);
+          break;
+        }
+        if (r == CompletionQueue::SHUTDOWN) {
+          GRPC_CHECK_EQ(batch_count, 0u);
+          drained_events.push_back({ready_cq, r, nullptr, false});
+          break;
+        }
+        GRPC_CHECK_EQ(r, CompletionQueue::GOT_EVENT);
+        GRPC_CHECK_GE(batch_count, 1u);
+        for (size_t i = 0; i < batch_count; i++) {
+          drained_events.push_back(
+              {ready_cq, r, batch_tags[i], batch_oks[i]});
+        }
+      }
+      g_is_nonblocking_poll = orig_val;
+    }
+    DrainedEvent next = drained_events.front();
+    drained_events.pop_front();
+    *out_cq = next.cq;
+    *got_tag = next.tag;
+    *ok = next.ok;
+    return next.status == CompletionQueue::GOT_EVENT;
+  };
+
+  constexpr int kBurstSize = 8;
+  struct RpcState {
+    EchoRequest send_request;
+    EchoRequest recv_request;
+    EchoResponse send_response;
+    EchoResponse recv_response;
+    Status recv_status;
+    ClientContext cli_ctx;
+    ServerContext srv_ctx;
+    grpc::ServerAsyncResponseWriter<EchoResponse> response_writer{&srv_ctx};
+    std::unique_ptr<ClientAsyncResponseReader<EchoResponse>> response_reader;
+  };
+
+  for (int round = 0; round < 4; round++) {
+    RpcState rpcs[kBurstSize];
+    for (int i = 0; i < kBurstSize; i++) {
+      rpcs[i].send_request.set_message("batched epoll eventfd rpc");
+      rpcs[i].response_reader = stub_->PrepareAsyncEcho(
+          &rpcs[i].cli_ctx, rpcs[i].send_request, &cli_cq);
+      rpcs[i].response_reader->StartCall();
+      rpcs[i].response_reader->Finish(&rpcs[i].recv_response,
+                                      &rpcs[i].recv_status, tag(100 + i));
+      service_->RequestEcho(&rpcs[i].srv_ctx, &rpcs[i].recv_request,
+                            &rpcs[i].response_writer, cq_.get(), cq_.get(),
+                            tag(200 + i));
+    }
+
+    int completed_tags = 0;
+    while (completed_tags < 3 * kBurstSize) {
+      CompletionQueue* which_cq = nullptr;
+      void* got_tag = nullptr;
+      bool ok = false;
+      ASSERT_TRUE(wait_next_on_epoll(&which_cq, &got_tag, &ok));
+      ASSERT_TRUE(ok);
+      const int t = detag(got_tag);
+      completed_tags++;
+      if (t >= 200 && t < 200 + kBurstSize) {
+        const int idx = t - 200;
+        EXPECT_EQ(which_cq, cq_.get());
+        EXPECT_EQ(rpcs[idx].send_request.message(),
+                  rpcs[idx].recv_request.message());
+        rpcs[idx].send_response.set_message(rpcs[idx].recv_request.message());
+        rpcs[idx].response_writer.Finish(rpcs[idx].send_response, Status::OK,
+                                         tag(300 + idx));
+      } else if (t >= 300 && t < 300 + kBurstSize) {
+        EXPECT_EQ(which_cq, cq_.get());
+      } else if (t >= 100 && t < 100 + kBurstSize) {
+        const int idx = t - 100;
+        EXPECT_EQ(which_cq, &cli_cq);
+        EXPECT_EQ(rpcs[idx].send_response.message(),
+                  rpcs[idx].recv_response.message());
+        EXPECT_TRUE(rpcs[idx].recv_status.ok());
+      } else {
+        FAIL() << "Unexpected tag: " << t;
+      }
+    }
+  }
+
+  cli_cq.Shutdown();
+  CompletionQueue* which_cq = nullptr;
+  void* got_tag = nullptr;
+  bool ok = false;
+  EXPECT_FALSE(wait_next_on_epoll(&which_cq, &got_tag, &ok));
+  EXPECT_EQ(which_cq, &cli_cq);
+
+  server_->Shutdown();
+  cq_->Shutdown();
+  while (wait_next_on_epoll(&which_cq, &got_tag, &ok)) {
+    EXPECT_EQ(which_cq, cq_.get());
+  }
+  EXPECT_EQ(which_cq, cq_.get());
+
+  close(epfd);
+  close(cli_efd);
+  close(srv_efd);
+}
 #endif  // GRPC_LINUX_EVENTFD
 
 }  // namespace
