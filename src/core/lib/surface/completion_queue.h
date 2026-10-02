@@ -23,6 +23,7 @@
 
 #include <grpc/grpc.h>
 #include <grpc/support/port_platform.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "src/core/lib/iomgr/error.h"
@@ -87,16 +88,33 @@ grpc_completion_queue* grpc_completion_queue_create_internal(
     grpc_cq_completion_type completion_type, grpc_cq_polling_type polling_type,
     grpc_completion_queue_functor* shutdown_callback);
 
+// Reads up to max_events completed events from a GRPC_CQ_NEXT completion queue,
+// blocking up to deadline (or until the queue is shut down) only if no events
+// are immediately available.
+// On return:
+// - If at least one event was retrieved, populates events[0 .. *num_events - 1],
+//   sets *num_events to the number of populated events (1 <= *num_events <=
+//   max_events), and returns GRPC_OP_COMPLETE.
+// - If no events were retrieved before deadline expired (or if max_events is
+//   0), sets *num_events to 0 and returns GRPC_QUEUE_TIMEOUT.
+// - If the completion queue is shut down and fully drained, sets *num_events to
+//   0 and returns GRPC_QUEUE_SHUTDOWN.
+grpc_completion_type grpc_cq_next_batch(grpc_completion_queue* cq,
+                                        grpc_event* events, size_t max_events,
+                                        size_t* num_events,
+                                        gpr_timespec deadline, void* reserved);
+
 // Creates and returns a non-blocking Linux eventfd associated with a
 // GRPC_CQ_NEXT completion queue that becomes readable when the queue
 // transitions from empty to non-empty or when the completion queue finishes
 // shutting down. On a read from the eventfd, the consumer must drain the
-// completion queue entirely by calling grpc_completion_queue_next() (or
-// CompletionQueue::AsyncNext()) with a zero deadline in a loop until it returns
-// GRPC_QUEUE_TIMEOUT (or GRPC_QUEUE_SHUTDOWN). Returns -1 if unsupported or if
-// an eventfd has already been released for this completion queue. Ownership of
-// the returned file descriptor is transferred to the caller, who is responsible
-// for closing it after the completion queue is shut down and drained.
+// completion queue entirely by calling grpc_completion_queue_next(),
+// grpc_cq_next_batch(), or CompletionQueue::AsyncNext() with a zero deadline in
+// a loop until it returns GRPC_QUEUE_TIMEOUT (or GRPC_QUEUE_SHUTDOWN). Returns
+// -1 if unsupported or if an eventfd has already been released for this
+// completion queue. Ownership of the returned file descriptor is transferred to
+// the caller, who is responsible for closing it after the completion queue is
+// shut down and drained.
 int grpc_cq_release_eventfd(grpc_completion_queue* cq);
 
 #endif  // GRPC_SRC_CORE_LIB_SURFACE_COMPLETION_QUEUE_H
