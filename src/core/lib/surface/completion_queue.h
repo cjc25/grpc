@@ -92,7 +92,8 @@ grpc_completion_queue* grpc_completion_queue_create_internal(
 // blocking up to deadline (or until the queue is shut down) only if no events
 // are immediately available.
 // On return:
-// - If at least one event was retrieved, populates events[0 .. *num_events - 1],
+// - If at least one event was retrieved, populates events[0 .. *num_events -
+// 1],
 //   sets *num_events to the number of populated events (1 <= *num_events <=
 //   max_events), and returns GRPC_OP_COMPLETE.
 // - If no events were retrieved before deadline expired (or if max_events is

@@ -1298,9 +1298,9 @@ TEST(GrpcCompletionQueueTest, TestNextBatchBlockingAndLargeCapacity) {
       for (;;) {
         grpc_event batch[16];
         size_t count = 0;
-        grpc_completion_type type = grpc_cq_next_batch(
-            mp_cq, batch, 16, &count, grpc_timeout_seconds_to_deadline(5),
-            nullptr);
+        grpc_completion_type type =
+            grpc_cq_next_batch(mp_cq, batch, 16, &count,
+                               grpc_timeout_seconds_to_deadline(5), nullptr);
         if (type == GRPC_OP_COMPLETE) {
           ASSERT_GE(count, 1u);
           ASSERT_LE(count, 16u);

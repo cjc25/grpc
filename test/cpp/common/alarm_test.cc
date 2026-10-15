@@ -25,13 +25,13 @@
 #include <thread>
 #include <vector>
 
-#include "absl/status/status.h"
-#include "gtest/gtest.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/iomgr/port.h"
 #include "src/core/lib/surface/completion_queue.h"
 #include "src/core/util/notification.h"
 #include "test/core/test_util/test_config.h"
+#include "gtest/gtest.h"
+#include "absl/status/status.h"
 
 #ifdef GRPC_LINUX_EVENTFD
 #include <errno.h>
@@ -719,7 +719,8 @@ TEST(AlarmTest, AsyncNextBatch) {
             CompletionQueue::TIMEOUT);
   EXPECT_EQ(count, 0u);
 
-  // 2. max_events == 0 returns TIMEOUT with count == 0 without consuming events.
+  // 2. max_events == 0 returns TIMEOUT with count == 0 without consuming
+  // events.
   Alarm alarm_expired;
   Alarm alarm_cancelled;
   void* tag_exp = reinterpret_cast<void*>(1001);
